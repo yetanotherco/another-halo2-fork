@@ -95,6 +95,76 @@ where
         Ok(())
     }
 
+    pub fn read_cs<R: io::Read>(
+        reader: &mut R,
+        format: SerdeFormat,
+        cs: ConstraintSystem<C::Scalar>
+    ) -> io::Result<Self> {
+        let mut version_byte = [0u8; 1];
+        reader.read_exact(&mut version_byte)?;
+        if 0x02 != version_byte[0] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected version byte",
+            ));
+        }
+        let mut k = [0u8; 4];
+        reader.read_exact(&mut k)?;
+        let k = u32::from_le_bytes(k);
+        let mut compress_selectors = [0u8; 1];
+        reader.read_exact(&mut compress_selectors)?;
+        if compress_selectors[0] != 0 && compress_selectors[0] != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected compress_selectors not boolean",
+            ));
+        }
+        let compress_selectors = compress_selectors[0] == 1;
+        let degree = cs.degree();
+        let domain = EvaluationDomain::new(degree as u32, k);
+
+        let mut num_fixed_columns = [0u8; 4];
+        reader.read_exact(&mut num_fixed_columns)?;
+        let num_fixed_columns = u32::from_le_bytes(num_fixed_columns);
+
+        let fixed_commitments: Vec<_> = (0..num_fixed_columns)
+            .map(|_| C::read(reader, format))
+            .collect::<io::Result<_>>()?;
+
+        let permutation = permutation::VerifyingKey::read(reader, &cs.permutation, format)?;
+
+        let (cs, selectors) = if compress_selectors {
+            // read selectors
+            let selectors: Vec<Vec<bool>> = vec![vec![false; 1 << k]; cs.num_selectors]
+                .into_iter()
+                .map(|mut selector| {
+                    let mut selector_bytes = vec![0u8; (selector.len() + 7) / 8];
+                    reader.read_exact(&mut selector_bytes)?;
+                    for (bits, byte) in selector.chunks_mut(8).zip(selector_bytes) {
+                        crate::helpers::unpack(byte, bits);
+                    }
+                    Ok(selector)
+                })
+                .collect::<io::Result<_>>()?;
+            let (cs, _) = cs.compress_selectors(selectors.clone());
+            (cs, selectors)
+        } else {
+            // we still need to replace selectors with fixed Expressions in `cs`
+            let fake_selectors = vec![vec![false]; cs.num_selectors];
+            let (cs, _) = cs.directly_convert_selectors_to_fixed(fake_selectors);
+            (cs, vec![])
+        };
+
+        Ok(Self::from_parts(
+            domain,
+            fixed_commitments,
+            permutation,
+            cs,
+            selectors,
+            compress_selectors,
+        ))
+    }
+
     /// Reads a verification key from a buffer.
     ///
     /// Reads a curve element from the buffer and parses it according to the `format`:
