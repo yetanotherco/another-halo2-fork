@@ -827,8 +827,10 @@ mod tests {
         let kzg_offset = vk_offset + vk_len;
         kzg_params_buffer[..kzg_params_len].clone_from_slice(&params_buf[kzg_offset..]);
 
+        let cs = bincode::deserialize(&cs_buffer).unwrap();
+
         let vk =
-            VerifyingKey::<G1Affine>::read_cs(&mut vk_reader, SerdeFormat::RawBytes, cs.clone())
+            VerifyingKey::<G1Affine>::read_cs(&mut vk_reader, SerdeFormat::RawBytes, cs)
                 .unwrap();
         let params =
             Params::read::<_>(&mut BufReader::new(&kzg_params_buffer[..kzg_params_len])).unwrap();
