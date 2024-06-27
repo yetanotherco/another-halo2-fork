@@ -35,6 +35,7 @@ mod multiopen_test;
 
 pub use domain::*;
 pub use query::{ProverQuery, VerifierQuery};
+use serde::{Deserialize, Serialize};
 pub use strategy::{Guard, VerificationStrategy};
 
 /// This is an error that could occur during proving or circuit synthesis.
@@ -349,7 +350,7 @@ impl<'a, F: Field, B: Basis> Sub<F> for &'a Polynomial<F, B> {
 /// Describes the relative rotation of a vector. Negative numbers represent
 /// reverse (leftmost) rotations and positive numbers represent forward (rightmost)
 /// rotations. Zero represents no rotation.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rotation(pub i32);
 
 impl Rotation {

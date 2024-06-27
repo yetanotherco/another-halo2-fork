@@ -7,6 +7,7 @@
 
 use blake2b_simd::Params as Blake2bParams;
 use group::ff::{Field, FromUniformBytes, PrimeField};
+use serde::Serialize;
 
 use crate::arithmetic::CurveAffine;
 use crate::helpers::{
@@ -39,7 +40,40 @@ pub use verifier::*;
 
 use evaluation::Evaluator;
 
-use std::io;
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
+
+/// Writes ConstraintSystemBack, VerifyingKey, and ProverParams to a file to be sent to aligned.
+pub fn write_params<C: CurveAffine>(
+    params_buf: &[u8],
+    cs_buf: &[u8],
+    vk_buf: &[u8],
+    params_path: &str,
+) -> Result<(), Error>
+where
+    <C as CurveAffine>::ScalarExt: Serialize,
+{
+    let vk_len = vk_buf.len();
+    let params_len = params_buf.len();
+
+    //Write everything to parameters file
+    let params_file = File::create(params_path).unwrap();
+    let mut writer = BufWriter::new(params_file);
+    //Write Parameter Lengths as u32
+    writer
+        .write_all(&(cs_buf.len() as u32).to_le_bytes())
+        .unwrap();
+    writer.write_all(&(vk_len as u32).to_le_bytes()).unwrap();
+    writer
+        .write_all(&(params_len as u32).to_le_bytes())
+        .unwrap();
+    //Write Parameters
+    writer.write_all(&cs_buf).unwrap();
+    writer.write_all(&vk_buf).unwrap();
+    writer.write_all(&params_buf).unwrap();
+    writer.flush().unwrap();
+    Ok(())
+}
 
 /// This is a verifying key which allows for the verification of proofs for a
 /// particular circuit.
@@ -98,7 +132,7 @@ where
     pub fn read_cs<R: io::Read>(
         reader: &mut R,
         format: SerdeFormat,
-        cs: ConstraintSystem<C::Scalar>
+        cs: ConstraintSystem<C::Scalar>,
     ) -> io::Result<Self> {
         let mut version_byte = [0u8; 1];
         reader.read_exact(&mut version_byte)?;
@@ -528,3 +562,286 @@ type ChallengeY<F> = ChallengeScalar<F, Y>;
 #[derive(Clone, Copy, Debug)]
 struct X;
 type ChallengeX<F> = ChallengeScalar<F, X>;
+
+#[cfg(test)]
+mod tests {
+    use super::io::BufReader;
+    use halo2curves::bn256::{Bn256, Fr, G1Affine};
+
+    use crate::{
+        circuit::{Layouter, SimpleFloorPlanner, Value},
+        poly::{
+            commitment::Params,
+            kzg::{multiopen::VerifierSHPLONK, strategy::SingleStrategy},
+            Rotation,
+        },
+    };
+
+    #[test]
+    fn test_proof_serialization() {
+        use super::*;
+
+        use crate::{
+            plonk::{create_proof, keygen_pk, keygen_vk_custom, verify_proof},
+            poly::kzg::{
+                commitment::{KZGCommitmentScheme, ParamsKZG},
+                multiopen::ProverSHPLONK,
+            },
+            transcript::{
+                Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer,
+                TranscriptWriterBuffer,
+            },
+        };
+        use ff::{Field, PrimeField};
+        use rand_core::OsRng;
+        use std::{
+            fs::File,
+            io::{BufWriter, ErrorKind, Read, Write},
+        };
+
+        fn read_fr(mut buf: &[u8]) -> Result<Vec<Fr>, ErrorKind> {
+            let mut instances = Vec::with_capacity(buf.len() / 32);
+            // Buffer to store each 32-byte slice
+            let mut buffer = [0; 32];
+
+            loop {
+                // Read 32 bytes into the buffer
+                match buf.read_exact(&mut buffer) {
+                    Ok(_) => {
+                        instances.push(Fr::from_bytes(&buffer).unwrap());
+                    }
+                    Err(ref e) if e.kind() == ErrorKind::UnexpectedEof => {
+                        // If end of file reached, break the loop
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("Error Deserializing Public Inputs: {}", e);
+                        return Err(ErrorKind::Other);
+                    }
+                }
+            }
+
+            Ok(instances)
+        }
+
+        #[derive(Clone, Copy)]
+        struct StandardPlonkConfig {
+            a: Column<Advice>,
+            b: Column<Advice>,
+            c: Column<Advice>,
+            q_a: Column<Fixed>,
+            q_b: Column<Fixed>,
+            q_c: Column<Fixed>,
+            q_ab: Column<Fixed>,
+            constant: Column<Fixed>,
+            #[allow(dead_code)]
+            instance: Column<Instance>,
+        }
+
+        impl StandardPlonkConfig {
+            fn configure(meta: &mut ConstraintSystem<Fr>) -> Self {
+                let [a, b, c] = [(); 3].map(|_| meta.advice_column());
+                let [q_a, q_b, q_c, q_ab, constant] = [(); 5].map(|_| meta.fixed_column());
+                let instance = meta.instance_column();
+
+                [a, b, c].map(|column| meta.enable_equality(column));
+
+                meta.create_gate(
+                    "q_a·a + q_b·b + q_c·c + q_ab·a·b + constant + instance = 0",
+                    |meta| {
+                        let [a, b, c] =
+                            [a, b, c].map(|column| meta.query_advice(column, Rotation::cur()));
+                        let [q_a, q_b, q_c, q_ab, constant] = [q_a, q_b, q_c, q_ab, constant]
+                            .map(|column| meta.query_fixed(column, Rotation::cur()));
+                        let instance = meta.query_instance(instance, Rotation::cur());
+                        Some(
+                            q_a * a.clone()
+                                + q_b * b.clone()
+                                + q_c * c
+                                + q_ab * a * b
+                                + constant
+                                + instance,
+                        )
+                    },
+                );
+
+                StandardPlonkConfig {
+                    a,
+                    b,
+                    c,
+                    q_a,
+                    q_b,
+                    q_c,
+                    q_ab,
+                    constant,
+                    instance,
+                }
+            }
+        }
+
+        #[derive(Clone, Default)]
+        struct StandardPlonk(Fr);
+
+        impl Circuit<Fr> for StandardPlonk {
+            type Config = StandardPlonkConfig;
+            type FloorPlanner = SimpleFloorPlanner;
+            #[cfg(feature = "circuit-params")]
+            type Params = ();
+
+            fn without_witnesses(&self) -> Self {
+                Self::default()
+            }
+
+            fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
+                StandardPlonkConfig::configure(meta)
+            }
+
+            fn synthesize(
+                &self,
+                config: Self::Config,
+                mut layouter: impl Layouter<Fr>,
+            ) -> Result<(), Error> {
+                layouter.assign_region(
+                    || "",
+                    |mut region| {
+                        region.assign_advice(config.a, 0, Value::known(self.0));
+                        region.assign_fixed(config.q_a, 0, -Fr::one());
+
+                        region.assign_advice(config.a, 1, Value::known(-Fr::from(5u64)));
+                        for (idx, column) in (1..).zip([
+                            config.q_a,
+                            config.q_b,
+                            config.q_c,
+                            config.q_ab,
+                            config.constant,
+                        ]) {
+                            region.assign_fixed(column, 1, Fr::from(idx as u64));
+                        }
+
+                        let a = region.assign_advice(config.a, 2, Value::known(Fr::one()));
+                        a.copy_advice(&mut region, config.b, 3);
+                        a.copy_advice(&mut region, config.c, 4);
+                        Ok(())
+                    },
+                )
+            }
+        }
+
+        let circuit = StandardPlonk(Fr::random(OsRng));
+        let params = ParamsKZG::setup(4, OsRng);
+        let compress_selectors = true;
+        let vk =
+            keygen_vk_custom(&params, &circuit, compress_selectors).expect("vk should not fail");
+        let cs = vk.cs();
+        let pk = keygen_pk(&params, vk.clone(), &circuit).expect("pk should not fail");
+        let instances: &[&[Fr]] = &[&[circuit.0]];
+
+        let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
+        create_proof::<
+            KZGCommitmentScheme<Bn256>,
+            ProverSHPLONK<'_, Bn256>,
+            Challenge255<G1Affine>,
+            _,
+            Blake2bWrite<Vec<u8>, G1Affine, Challenge255<_>>,
+            _,
+        >(
+            &params,
+            &pk,
+            &[circuit.clone()],
+            &[instances],
+            OsRng,
+            &mut transcript,
+        )
+        .expect("prover should not fail");
+        let proof = transcript.finalize();
+
+        //write public input
+        let f = File::create("public_input.bin").unwrap();
+        let mut writer = BufWriter::new(f);
+        instances.to_vec().into_iter().flatten().for_each(|fp| {
+            writer.write(&fp.to_repr()).unwrap();
+        });
+        writer.flush().unwrap();
+
+        //write proof
+        let f = File::create("proof.bin").unwrap();
+        let mut writer = BufWriter::new(f);
+        writer.write(&proof).unwrap();
+        writer.flush().unwrap();
+
+        let cs_buf = bincode::serialize(cs).unwrap();
+
+        let mut vk_buf = Vec::new();
+        vk.write(&mut vk_buf, SerdeFormat::RawBytes).unwrap();
+
+        // write cs, vk, params
+        let mut params_buf = Vec::new();
+        params.write(&mut params_buf).unwrap();
+        write_params::<G1Affine>(&params_buf, &cs_buf, &vk_buf, "params.bin").unwrap();
+
+        // Read Instances
+        let mut f = File::open("public_input.bin").unwrap();
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).unwrap();
+        let res = read_fr(&buf).unwrap();
+        let instances = res.as_slice();
+
+        // Read Proof
+        let mut f = File::open("proof.bin").unwrap();
+        let mut proof = Vec::new();
+        f.read_to_end(&mut proof).unwrap();
+
+        // Read Params
+        let mut f = File::open("params.bin").unwrap();
+        let mut params_buf = Vec::new();
+        f.read_to_end(&mut params_buf).unwrap();
+
+        // Select Constraint System Bytes
+        let cs_len_buf: [u8; 4] = params_buf[..4]
+            .try_into()
+            .map_err(|_| "Failed to convert slice to [u8; 4]")
+            .unwrap();
+        let cs_len = u32::from_le_bytes(cs_len_buf) as usize;
+        let mut cs_buffer = vec![0u8; cs_len];
+        let cs_offset = 12;
+        cs_buffer[..cs_len].clone_from_slice(&params_buf[cs_offset..(cs_offset + cs_len)]);
+
+        // Select Verifier Key Bytes
+        let vk_len_buf: [u8; 4] = params_buf[4..8]
+            .try_into()
+            .map_err(|_| "Failed to convert slice to [u8; 4]")
+            .unwrap();
+        let vk_len = u32::from_le_bytes(vk_len_buf) as usize;
+        let mut vk_buffer = vec![0u8; vk_len];
+        let vk_offset = cs_offset + cs_len;
+        vk_buffer[..vk_len].clone_from_slice(&params_buf[vk_offset..(vk_offset + vk_len)]);
+        let mut vk_reader = &mut BufReader::new(vk_buffer.as_slice());
+
+        // Select KZG Params Bytes
+        let kzg_len_buf: [u8; 4] = params_buf[8..12]
+            .try_into()
+            .map_err(|_| "Failed to convert slice to [u8; 4]")
+            .unwrap();
+        let kzg_params_len = u32::from_le_bytes(kzg_len_buf) as usize;
+        let mut kzg_params_buffer = vec![0u8; kzg_params_len];
+        let kzg_offset = vk_offset + vk_len;
+        kzg_params_buffer[..kzg_params_len].clone_from_slice(&params_buf[kzg_offset..]);
+
+        let vk =
+            VerifyingKey::<G1Affine>::read_cs(&mut vk_reader, SerdeFormat::RawBytes, cs.clone())
+                .unwrap();
+        let params =
+            Params::read::<_>(&mut BufReader::new(&kzg_params_buffer[..kzg_params_len])).unwrap();
+
+        let strategy = SingleStrategy::new(&params);
+        let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
+        assert!(verify_proof::<
+            KZGCommitmentScheme<Bn256>,
+            VerifierSHPLONK<'_, Bn256>,
+            Challenge255<G1Affine>,
+            Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>>,
+            SingleStrategy<'_, Bn256>,
+        >(&params, &vk, strategy, &[&[instances]], &mut transcript)
+        .is_ok());
+    }
+}

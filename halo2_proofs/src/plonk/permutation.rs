@@ -16,11 +16,12 @@ pub(crate) mod prover;
 pub(crate) mod verifier;
 
 pub use keygen::Assembly;
+use serde::{Deserialize, Serialize};
 
 use std::io;
 
 /// A permutation argument.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Argument {
     /// A sequence of columns involved in the argument.
     pub(super) columns: Vec<Column<Any>>,
