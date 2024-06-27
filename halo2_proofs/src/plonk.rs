@@ -43,6 +43,8 @@ use evaluation::Evaluator;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 
+pub type ZK_EMAIL_PROVING_KEY = halo2_base::halo2_proofs::plonk::ProvingKey<halo2_base::halo2_proofs::halo2curves::bn256::G1Affine>;
+
 /// Writes ConstraintSystemBack, VerifyingKey, and ProverParams to a file to be sent to aligned.
 pub fn write_params<C: CurveAffine>(
     params_buf: &[u8],
